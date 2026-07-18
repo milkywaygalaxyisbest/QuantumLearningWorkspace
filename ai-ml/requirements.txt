@@ -1,0 +1,10 @@
+# All packages below are free and open-source. None require an API key or paid tier.
+pymupdf                 # PDF text extraction (fitz)
+youtube-transcript-api  # YouTube transcript extraction, no API key needed
+trafilatura             # Web article extraction, strips ads/nav automatically
+lxml_html_clean         # Required by trafilatura/justext with newer lxml versions
+fastapi                 # API framework
+uvicorn                 # ASGI server to run FastAPI
+python-multipart        # Needed by FastAPI for file uploads (PDF endpoint)
+pydantic                # Request body validation (already a FastAPI dependency)
+yt_dlp                  # Download metadata/transcripts when needed
