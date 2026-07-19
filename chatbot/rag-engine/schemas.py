@@ -24,7 +24,7 @@ class AskRequest(BaseModel):
         default=None,
         ge=1,
         le=8,
-        description=f"Number of chunks to retrieve (default {DEFAULT_TOP_K}, max 8)",
+        description=f"Number of chunks to keep per retrieval round (default {DEFAULT_TOP_K}, max 8)",
     )
     include_sources: bool = Field(
         default=True,
@@ -35,6 +35,13 @@ class AskRequest(BaseModel):
         description=(
             "When true, retrieve a wider candidate pool and LLM-rerank to top_k. "
             "Ignored if ENABLE_RERANK=false in the environment."
+        ),
+    )
+    multi_hop: bool = Field(
+        default=True,
+        description=(
+            "When true, allow up to MAX_RETRIEVAL_ROUNDS agentic retrieval hops. "
+            "Ignored if ENABLE_MULTI_HOP=false."
         ),
     )
 
@@ -51,6 +58,7 @@ class SourceItem(BaseModel):
     id: str
     distance: float | None = None
     preview: str
+    source: str = ""
 
 
 class AskResponse(BaseModel):
@@ -61,6 +69,9 @@ class AskResponse(BaseModel):
     source_ids: list[str] = Field(default_factory=list)
     rewritten_question: str = ""
     grounded: bool | None = None
+    retrieval_rounds: int = 0
+    hop_queries: list[str] = Field(default_factory=list)
+    conflict_hint: bool = False
 
 
 class HealthResponse(BaseModel):

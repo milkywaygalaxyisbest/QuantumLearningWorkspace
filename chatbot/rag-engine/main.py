@@ -4,9 +4,6 @@ Team Mu RAG Chat API — FastAPI service (separate from web/backend).
 Run from chatbot/rag-engine/:
   uvicorn main:app --reload --host 127.0.0.1 --port 8001
 
-Or from repo root:
-  uvicorn main:app --reload --app-dir chatbot/rag-engine --host 127.0.0.1 --port 8001
-
 Interactive docs: http://127.0.0.1:8001/docs
 """
 
@@ -21,7 +18,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from rag_service import RagEngine, ask, create_engine, load_env
 from schemas import AskRequest, AskResponse, HealthResponse, SourceItem
 
-# Module-level engine set during lifespan
 _engine: RagEngine | None = None
 
 
@@ -48,11 +44,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="StudyMind Chatbot — RAG API",
     description=(
-        "Team Mu chat service: query rewriting, multi-chunk retrieval, "
-        "optional LLM re-ranking, source attribution, and grounding checks. "
-        "See docs/api-contracts.md for the Web team contract."
+        "Team Mu chat service: multi-hop retrieval, conflict-aware answers, "
+        "prompt-injection defenses, query rewriting, and grounding checks. "
+        "See docs/api-contracts.md and docs/architecture.md."
     ),
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -94,11 +90,11 @@ def ask_endpoint(body: AskRequest) -> AskResponse:
             include_sources=body.include_sources,
             update_history=False,
             rerank=body.rerank,
+            multi_hop=body.multi_hop,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
-        # Missing GROQ_API_KEY when an LLM call is required
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     sources = None
@@ -109,7 +105,12 @@ def ask_endpoint(body: AskRequest) -> AskResponse:
             source_ids = []
         else:
             sources = [
-                SourceItem(id=s.id, distance=s.distance, preview=s.preview)
+                SourceItem(
+                    id=s.id,
+                    distance=s.distance,
+                    preview=s.preview,
+                    source=s.source,
+                )
                 for s in result.sources
             ]
             source_ids = list(result.source_ids) or [s.id for s in result.sources]
@@ -122,4 +123,7 @@ def ask_endpoint(body: AskRequest) -> AskResponse:
         source_ids=source_ids,
         rewritten_question=result.rewritten_question,
         grounded=result.grounded,
+        retrieval_rounds=result.retrieval_rounds,
+        hop_queries=list(result.hop_queries),
+        conflict_hint=result.conflict_hint,
     )

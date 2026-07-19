@@ -29,11 +29,16 @@ def print_result(question: str, result: AskResult) -> None:
         f"top_k={result.top_k} refused={result.refused} "
         f"grounded={result.grounded} source_ids={result.source_ids}"
     )
+    print(
+        f"retrieval_rounds={result.retrieval_rounds} "
+        f"hop_queries={result.hop_queries} conflict_hint={result.conflict_hint}"
+    )
     if result.sources:
         print(f"\nRetrieved {len(result.sources)} chunk(s):")
         for src in result.sources:
             dist = f", distance={src.distance:.4f}" if src.distance is not None else ""
-            print(f"  - {src.id}{dist}: {src.preview}")
+            src_label = f" source={src.source}" if src.source else ""
+            print(f"  - {src.id}{dist}{src_label}: {src.preview}")
     print("\nLLM Final Answer:\n" if not result.refused else "\nRefusal:\n")
     print(result.answer)
     if result.refused and result.answer != REFUSAL_MESSAGE:

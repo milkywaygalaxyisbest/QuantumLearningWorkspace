@@ -34,7 +34,12 @@ SCRIPTED_TURNS = [
 
 def _print_result(result) -> None:
     print(f"Rewritten query: {result.rewritten_question}")
-    print(f"grounded={result.grounded} refused={result.refused}")
+    print(
+        f"grounded={result.grounded} refused={result.refused} "
+        f"rounds={result.retrieval_rounds} conflict_hint={result.conflict_hint}"
+    )
+    if result.hop_queries:
+        print(f"hop_queries: {result.hop_queries}")
     if result.source_ids:
         print(f"source_ids: {result.source_ids}")
     if result.sources:

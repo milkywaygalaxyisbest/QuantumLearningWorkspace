@@ -89,7 +89,7 @@ def is_relevant(
 
 
 def format_retrieved_chunks(documents: list[str]) -> str:
-    """Join one or more retrieved chunks for the LLM prompt."""
+    """Join one or more retrieved chunks for the LLM prompt (legacy simple format)."""
     if not documents:
         return ""
     if len(documents) == 1:
@@ -97,6 +97,32 @@ def format_retrieved_chunks(documents: list[str]) -> str:
     parts = []
     for i, doc in enumerate(documents, start=1):
         parts.append(f"[Chunk {i}]\n{doc}")
+    return "\n\n".join(parts)
+
+
+def format_untrusted_chunks(
+    documents: list[str],
+    ids: list[str] | None = None,
+    metadatas: list[dict] | None = None,
+) -> str:
+    """
+    Wrap chunks in clear untrusted-document delimiters for the LLM.
+
+    Retrieved text is data to reference, never instructions to follow.
+    """
+    if not documents:
+        return ""
+    parts: list[str] = []
+    for i, doc in enumerate(documents):
+        chunk_id = ids[i] if ids and i < len(ids) else f"chunk_{i}"
+        source = ""
+        if metadatas and i < len(metadatas) and isinstance(metadatas[i], dict):
+            source = str(metadatas[i].get("source") or "")
+        parts.append(
+            f'<<<UNTRUSTED_DOCUMENT id="{chunk_id}" source="{source}">>>\n'
+            f"{doc}\n"
+            f"<<<END_UNTRUSTED_DOCUMENT>>>"
+        )
     return "\n\n".join(parts)
 
 
