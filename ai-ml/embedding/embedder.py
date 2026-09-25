@@ -1,126 +1,112 @@
 """
-Orchestrates the full embedding pipeline:
+Orchestrates document embedding + the search interface quiz
+generation uses.
 
-  document (common ingestion schema)
-      -> chunk (chunker.py)
-      -> embed (model.py, free local sentence-transformers)
-      -> store full chunk text + metadata in MongoDB   (source of truth)
-      -> store vector + small pointer metadata in Pinecone (for search)
+[P0-1 fix] This used to run its own parallel storage path — full
+chunk text in MongoDB (source of truth) + vectors in Pinecone (for
+search) — completely separate from ingestion's shared ChromaDB. That
+meant anything ingested via ingestion/main.py was invisible to
+QuizService.generate_quiz_from_topic(), since it searched Pinecone.
 
-MongoDB holds the full text because Pinecone metadata has size/type
-limits and isn't meant for large text blobs. Pinecone only stores the
-vector plus a small pointer (chunk id + a few filterable fields) so a
-similarity search can be resolved back to the full chunk via MongoDB.
+Everything now reads and writes the ONE shared ChromaDB collection
+via chroma_store.py — the same collection ingestion already writes
+to. No more Mongo/Pinecone clients, no more second indexing path.
 """
 
 import uuid
-from pymongo import MongoClient
 
-from embedding.config import settings
 from embedding.chunker import chunk_document
-from embedding.model import get_embedding_model
-from embedding.vector_store import PineconeVectorStore
+from embedding.chroma_store import store_chunks, query_chunks, delete_chunks
 
 import argparse
 import requests
 
 
 class Embedder:
-    def __init__(self, model=None, vector_store=None, mongo_client=None):
-        self.model = model or get_embedding_model()
-        self.vector_store = vector_store or PineconeVectorStore(dimension=self.model.dimension())
+    def __init__(self):
+        # No client setup needed here anymore — chroma_store.py owns
+        # the one shared collection + embedding model as module-level
+        # helpers, created fresh per call (see get_collection()).
+        pass
 
-        self._mongo_client = mongo_client or MongoClient(settings.mongodb_uri)
-        self._db = self._mongo_client[settings.mongodb_db]
-        self._collection = self._db[settings.mongodb_collection]
-
-    def embed_document(self, document: dict) -> dict:
+    def embed_document(self, document: dict, user_id: str = "unknown") -> dict:
         """
         document: common ingestion schema
           { "source_type": ..., "title": ..., "text": ..., "metadata": {...} }
 
-        Chunks it, embeds every chunk, saves full text to MongoDB, and
-        upserts vectors to Pinecone. Returns a small summary dict.
+        Chunks it and stores it in the shared ChromaDB collection.
+        Returns a small summary dict.
+
+        Note: the normal ingestion request path (POST /ingest/pdf etc.)
+        goes through ingestion/main.py's own _chunk_and_store(), which
+        calls chroma_store.store_chunks() directly and doesn't use
+        this method. This method exists for standalone/manual use
+        (see the CLI at the bottom of this file) and now writes to the
+        exact same store, so both paths stay consistent.
+
+        [Task 5, pending] Auto-updating the knowledge graph on upload
+        needs to be hooked in here AND in ingestion/main.py's
+        _chunk_and_store() (the actual path real uploads use) —
+        intentionally not added yet, since the ingestion-side change
+        is being held off for review before touching shared code.
         """
         chunks = chunk_document(document)
         if not chunks:
             return {"document_id": None, "chunks_stored": 0}
 
-        texts = [c["text"] for c in chunks]
-        vectors = self.model.encode(texts)
-
         document_id = str(uuid.uuid4())
-        mongo_docs = []
-        pinecone_vectors = []
+        stored_count = store_chunks(
+            chunks=chunks,
+            user_id=user_id,
+            document_id=document_id,
+            title=document.get("title", ""),
+        )
 
-        for chunk, vector in zip(chunks, vectors):
-            chunk_id = f"{document_id}_{chunk['chunk_index']}"
+        return {"document_id": document_id, "chunks_stored": stored_count}
 
-            mongo_docs.append({
-                "_id": chunk_id,
-                "document_id": document_id,
-                "chunk_index": chunk["chunk_index"],
-                "text": chunk["text"],
-                "title": chunk["title"],
-                "source_type": chunk["source_type"],
-                "metadata": chunk["metadata"],
-            })
-
-            pinecone_vectors.append({
-                "id": chunk_id,
-                "values": vector,
-                "metadata": {
-                    "document_id": document_id,
-                    "chunk_index": chunk["chunk_index"],
-                    "title": chunk["title"],
-                    "source_type": chunk["source_type"],
-                },
-            })
-
-        if mongo_docs:
-            self._collection.insert_many(mongo_docs)
-
-        self.vector_store.upsert(pinecone_vectors)
-
-        return {"document_id": document_id, "chunks_stored": len(mongo_docs)}
-
-    def search(self, query: str, top_k: int = 5) -> list:
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        user_id: str = None,
+        document_id: str = None,
+    ) -> list:
         """
-        Embeds the query, finds the nearest chunks in Pinecone, then
-        resolves each match back to its full text stored in MongoDB.
+        Searches the shared ChromaDB collection — the same store
+        ingestion writes to, so newly ingested content is immediately
+        queryable here (P0-1's Definition of Done).
+
+        user_id / document_id are optional scoping filters, passed
+        straight through to chroma_store.query_chunks(). Left as None
+        by default (unscoped), matching current QuizService behavior;
+        P0-3 is what wires the caller-side enforcement of these.
         """
-        query_vector = self.model.encode(query)[0]
-        matches = self.vector_store.query(query_vector, top_k=top_k)
+        return query_chunks(query, top_k=top_k, user_id=user_id, document_id=document_id)
 
-        results = []
-        for match in matches:
-            chunk_id = match["id"] if isinstance(match, dict) else match.id
-            score = match["score"] if isinstance(match, dict) else match.score
-
-            mongo_doc = self._collection.find_one({"_id": chunk_id})
-            if mongo_doc:
-                results.append({
-                    "score": score,
-                    "text": mongo_doc["text"],
-                    "title": mongo_doc["title"],
-                    "source_type": mongo_doc["source_type"],
-                    "metadata": mongo_doc["metadata"],
-                })
-        return results
-
-    def delete_document(self, document_id: str, chunk_count: int):
-        """Remove a document's chunks from both MongoDB and Pinecone."""
-        ids = [f"{document_id}_{i}" for i in range(chunk_count)]
-        self._collection.delete_many({"document_id": document_id})
-        self.vector_store.delete(ids)
+    def delete_document(self, document_id: str, chunk_count: int = None):
+        """
+        Remove a document's chunks from the shared store.
+        chunk_count is no longer needed (Chroma deletes by
+        document_id metadata filter, not by reconstructing chunk ids)
+        but is accepted for backward compatibility with existing callers.
+        """
+        delete_chunks(document_id)
 
     def close(self):
-        self._mongo_client.close()
+        """
+        No-op now — chroma_store.py doesn't hold a persistent client
+        connection open between calls, so there's nothing to close.
+        Kept so existing callers (e.g. the CLI below) don't need to
+        change.
+        """
+        pass
 
 
-
-
-INGESTION_BASE_URL = "http://127.0.0.1:8000"
+INGESTION_BASE_URL = "http://127.0.0.1:8001"
+# NOTE: this was previously "http://127.0.0.1:8000", which is Mu's
+# confirmed port, not Lambda ingestion's. Per the confirmed port
+# scheme (Mu=8000, Pluto=5000, Lambda ingestion=8001, Lambda
+# quiz=8002), 8001 is correct here.
 
 
 def _fetch_from_ingestion(pdf=None, youtube=None, article=None) -> dict:
@@ -168,7 +154,7 @@ if __name__ == "__main__":
         }
 
     embedder = Embedder()
-    summary = embedder.embed_document(document)
+    summary = embedder.embed_document(document, user_id="cli-test-user")
     print("Embedded:", summary)
 
     query = document.get("title") or document.get("text", "")[:50]

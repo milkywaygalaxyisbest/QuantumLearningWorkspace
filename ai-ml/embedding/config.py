@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).parent.parent.parent / ".env")
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -50,6 +50,6 @@ class Settings:
     # ---------------- Chunking ----------------
     chunk_size: int = field(default_factory=lambda: int(os.getenv("CHUNK_SIZE", "300")))     # words per chunk
     chunk_overlap: int = field(default_factory=lambda: int(os.getenv("CHUNK_OVERLAP", "50")))  # overlap in words
-
-
+    
 settings = Settings()
+

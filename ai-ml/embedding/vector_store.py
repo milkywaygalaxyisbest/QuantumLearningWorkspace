@@ -5,7 +5,10 @@ Free tier: Pinecone's Starter/serverless plan supports this use case
 at no cost for typical student-project volumes — verify current limits
 at https://www.pinecone.io/pricing/ since free-tier terms can change.
 """
+import os
+from dotenv import load_dotenv
 
+load_dotenv(os.path.join(os.path.dirname(__file__), "../../.env"))
 from pinecone import Pinecone, ServerlessSpec
 
 from embedding.config import settings

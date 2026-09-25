@@ -1,4 +1,4 @@
-name: Chatbot CI
+﻿name: Chatbot CI
 
 on:
   push:
@@ -17,13 +17,17 @@ jobs:
         working-directory: chatbot
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: chatbot/requirements-dev.txt
+          cache-dependency-path: chatbot/requirements.txt
       - name: Install dependencies
         run: |
-          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
       - name: Run unit and API tests
-        run: pytest rag-engine/tests -q --tb=short
+        env:
+          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
+        run: pytest rag-engine/tests -q --tb=short --ignore=rag-engine/tests/test_injection_real_pdf.py

@@ -9,7 +9,7 @@ Team Pluto (Web) will call it from the frontend.
 
 **Service root:** `chatbot/rag-engine/` (separate from `web/backend/`)
 
-**Default local base URL:** `http://127.0.0.1:8001`
+**Default local base URL:** `http://127.0.0.1:8000`
 
 **Run:**
 
@@ -17,14 +17,14 @@ Team Pluto (Web) will call it from the frontend.
 cd chatbot
 pip install -r requirements.txt
 cd rag-engine
-uvicorn main:app --reload --host 127.0.0.1 --port 8001
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Interactive docs: [http://127.0.0.1:8001/docs](http://127.0.0.1:8001/docs)
+Interactive docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 
 Env vars: see `chatbot/rag-engine/.env.example` (includes `ENABLE_CACHE`, `RATE_LIMIT_MAX`, `ENABLE_MULTI_HOP`, etc.).
 
-**Pipeline:** query rewrite → multi-hop retrieve → optional re-rank → relevance gate → answer → grounding check. `/ask` also applies cache, rate limits, and timing.
+**Pipeline:** query rewrite → multi-hop retrieve → optional re-rank → relevance gate → answer → grounding check. `/ask` also applies auth, cache, rate limits, and timing.
 
 ---
 
@@ -60,11 +60,23 @@ Env vars: see `chatbot/rag-engine/.env.example` (includes `ENABLE_CACHE`, `RATE_
 
 ### `POST /ask`
 
+#### Authentication
+
+Requires header: `Authorization: Bearer <jwt>`
+
+The token is verified against `JWT_SECRET_KEY` (HS256) — the same secret the Web team's `/login` issues tokens with. The user's identity (email) is read from the token's `sub` claim, **not** from the request body. There is no `user_id` field in the request anymore — that was a security fix (previously a client could claim to be any user just by sending a `user_id`).
+
+| Failure | Status | Body |
+|---------|--------|------|
+| Missing `Authorization` header | `403` | `{"detail": "Not authenticated"}` (FastAPI's default — `auth.py` never runs) |
+| Token present but invalid/expired | `401` | `{"detail": "Could not validate credentials."}` |
+| Server missing `JWT_SECRET_KEY` | `500` | `{"detail": "Server is not configured with a JWT secret."}` |
+
 #### Request body
 
 | Field | Type | Required | Default | Notes |
 |-------|------|----------|---------|--------|
-| `question` | string | yes | — | Non-empty |
+| `question` | string | yes | — | Non-empty, max 2000 chars |
 | `history` | array | no | omit | Triggers query rewrite |
 | `top_k` | integer | no | `4` | Clamped **1–8** |
 | `include_sources` | boolean | no | `true` | Rich `sources` objects |
@@ -72,26 +84,76 @@ Env vars: see `chatbot/rag-engine/.env.example` (includes `ENABLE_CACHE`, `RATE_
 | `multi_hop` | boolean | no | `true` | Agentic retrieval hops |
 | `skip_cache` | boolean | no | `false` | Bypass cache; or header `X-Skip-Cache: 1` |
 
-**Rate limit:** 10 requests / 60s per `X-User-Id` (or client IP). Returns **429** with `Retry-After` header.
+No `user_id` field — identity comes from the JWT.
 
-#### Response `200` (additive Phase 7 fields)
+**Rate limit:** 10 requests / 60s per authenticated user (keyed by the JWT `sub` email). Returns **429** with `Retry-After` header. Rate limiting requires a valid token — an unauthenticated request fails at the auth step (403/401) before rate limiting is ever checked.
+
+**Example request:**
+
+```bash
+curl -X POST http://127.0.0.1:8000/ask \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..." \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Where does the Calvin cycle take place?"}'
+```
+
+#### Response `200`
 
 | Field | Type | Notes |
 |-------|------|--------|
+| `answer` | string | Final answer text |
+| `refused` | boolean | `true` if question was off-topic / ungrounded |
+| `no_documents` | boolean | `true` if the user has no uploaded documents at all |
+| `top_k` | integer | Effective `top_k` used |
+| `sources` | array \| null | Present when `include_sources: true` |
+| `source_ids` | array | Chunk ids used |
+| `rewritten_question` | string | Query after history-aware rewrite |
+| `grounded` | boolean \| null | Faithfulness check result |
+| `retrieval_rounds` | integer | Number of multi-hop rounds |
+| `hop_queries` | array | Queries used per hop |
+| `conflict_hint` | boolean | `true` if sources disagree |
 | `cached` | boolean | `true` if served from in-memory cache |
 | `timing` | object | `{retrieval_ms, llm_ms, grounding_ms, total_ms}` |
 
 **Response headers:** `X-Cache-Hit`, `X-Retrieval-Ms`, `X-Llm-Ms`, `X-Total-Ms`
 
-Plus all Phase 6 fields: `answer`, `refused`, `sources`, `source_ids`, `rewritten_question`, `grounded`, `retrieval_rounds`, `hop_queries`, `conflict_hint`.
+**Example response:**
 
-**Cache rules:** Identical question + history + `top_k` / `rerank` / `multi_hop` hits cache. Refusals and `grounded: false` answers are **not** cached.
+```json
+{
+  "answer": "The Calvin cycle takes place in the stroma of the chloroplast.",
+  "refused": false,
+  "no_documents": false,
+  "top_k": 4,
+  "sources": [
+    {"id": "pdf_chunk_3", "distance": 0.41, "preview": "...Calvin cycle occurs in the stroma...", "source": "biology_notes.pdf", "document": "biology_notes.pdf"}
+  ],
+  "source_ids": ["pdf_chunk_3"],
+  "rewritten_question": "Where does the Calvin cycle take place?",
+  "grounded": true,
+  "retrieval_rounds": 1,
+  "hop_queries": ["Where does the Calvin cycle take place?"],
+  "conflict_hint": false,
+  "cached": false,
+  "timing": {"retrieval_ms": 410.2, "llm_ms": 1820.5, "grounding_ms": 310.1, "total_ms": 2540.8}
+}
+```
+
+**Example 401 (missing/invalid token):**
+
+```json
+{"detail": "Could not validate credentials."}
+```
+
+**Cache rules:** Identical question + history + `top_k` / `rerank` / `multi_hop`, per authenticated user, hits cache. Refusals and `grounded: false` answers are **not** cached.
 
 ---
 
 ### `POST /ask/stream`
 
 Streams the answer as **NDJSON** (`Content-Type: application/x-ndjson`). Same request body as `/ask`. Rate limited identically.
+
+**Authentication:** Same as `/ask` — requires `Authorization: Bearer <jwt>`. See failure table above.
 
 **Event types:**
 
@@ -128,17 +190,358 @@ python scripts/stream_client.py "Where does the Calvin cycle occur?"
 | Status | When |
 |--------|------|
 | `400` | Empty / invalid `question` |
+| `401` | Token present but invalid/expired |
+| `403` | Missing `Authorization` header |
 | `429` | Rate limit exceeded (`Retry-After` header) |
 | `503` | Engine not ready, or missing `GROQ_API_KEY` |
 
----
+
+
+-------
 
 ## Web backend (Team Pluto)
+**Service root:** `web/backend/`
+**Default local base URL:** `http://127.0.0.1:5000`
+**Run:**
+```bash
+cd web/backend
+uvicorn main:app --reload --port 5000
+```
+Env vars: see `web/backend/.env.example` (`MONGODB_URI`, `JWT_SECRET_KEY`, `INTERNAL_SERVICE_KEY`, `CHATBOT_SERVICE_URL`, `INGESTION_SERVICE_URL`, `QUIZ_SERVICE_URL`).
 
-See `web/backend/` — `GET /health`. Chatbot `/ask` lives only on the Mu service.
+Chatbot `/ask` lives only on the Mu service — Pluto's frontend calls it directly, not through this backend, except where noted below.
+
+### Auth
+| Endpoint | Method | Notes |
+|----------|--------|-------|
+| `/signup` | POST | `{email, password, full_name}` |
+| `/login` | POST | `{email, password}` → `{access_token}` (JWT, HS256, same `JWT_SECRET_KEY` Mu/Lambda verify) |
+| `/change-password` | POST | Requires `Authorization: Bearer <jwt>` |
+
+### Uploads
+| Endpoint | Method | Notes |
+|----------|--------|-------|
+| `/upload` | POST | Multipart PDF upload. Creates a MongoDB record (`status: Processing`), then forwards the file to Lambda's ingestion service (`Authorization: Bearer <jwt>` built server-side via `create_access_token`, not a client-supplied identity) as a background task. Status becomes `Ready` (with `chunks_stored`) or `Failed` (with `last_error`). |
+| `/uploads` | GET | Lists the authenticated user's own uploads only |
+| `/uploads/{upload_id}` | DELETE | Deletes the local file + MongoDB record, and calls Lambda's `DELETE /documents/{document_id}` (with a server-built JWT) to purge the vector store. Non-200 from that call is logged as a warning, not silently treated as success. |
+| `/uploads/{upload_id}/preview` | GET | — |
+
+### Internal service key
+Some Pluto endpoints (e.g. `GET /quiz-results/{user_id}`) are for service-to-service use only, protected by `X-Internal-Key` header verified against `INTERNAL_SERVICE_KEY` — separate from the JWT scheme above. Used when another service calls **into** Pluto; Pluto's own outbound calls to Lambda/Mu use JWT (see Uploads above).
+
+------
+
+## Ingestion (Team Lambda)
+**Service root:** `ai-ml/ingestion/`
+**Default local base URL:** `http://127.0.0.1:8001`
+**Run:**
+```bash
+cd ai-ml
+uvicorn ingestion.main:app --reload --port 8001
+```
+Extracted document text must be treated as **untrusted data** when fed into RAG (see `docs/architecture.md` — Team Mu RAG security).
+
+#### Authentication
+All endpoints below require `Authorization: Bearer <jwt>` (same scheme as `/ask` — HS256, `JWT_SECRET_KEY`, identity from the `sub` claim). `user_id` is never accepted from the client (form field, query param, or body) — it comes only from the verified token.
+
+| Endpoint | Method | Notes |
+|----------|--------|-------|
+| `/ingest/pdf` | POST | Multipart file upload |
+| `/ingest/youtube` | POST | `{url}` |
+| `/ingest/article` | POST | `{url}` |
+| `/documents/{document_id}` | DELETE | Purges all chunks for `document_id` from the shared ChromaDB collection. Idempotent — safe to call on an already-purged or nonexistent `document_id`. Called by Pluto's `/uploads/{upload_id}` DELETE. |
+
+All three ingest endpoints return `{document_id, title, chunks_stored, ...}` — `document_id` is generated server-side here and is **not** the same value as any `document_id` the caller may have used upstream (e.g. Pluto's own record); callers should persist the value returned in this response as the canonical ID for that content going forward.
+
+
 
 ---
 
-## Ingestion (Team Lambda)
+## Quiz Generation (Team Lambda)
 
-See `ai-ml/ingestion/`. Extracted document text must be treated as **untrusted data** when fed into RAG (see `docs/architecture.md` — Team Mu RAG security).
+**Service root:** `ai-ml/quiz_generator/`
+
+**Default local base URL:** `http://127.0.0.1:8002`
+
+**Run:**
+
+```bash
+cd ai-ml
+uvicorn quiz_generator.app.main:app --reload --port 8002
+```
+
+Interactive docs: [http://127.0.0.1:8002/docs](http://127.0.0.1:8002/docs)
+
+Env vars (`ai-ml/.env`): `GROQ_API_KEY`, `JWT_SECRET_KEY`, `CHROMA_DB_PATH`.
+**Pipeline:** topic → embedding search in the shared ChromaDB collection (same store Lambda ingestion writes to and Mu reads from), scoped to the authenticated user's `user_id` → LLM generates structured questions per `quiz_type` → split into a public `questions` list (no answers) and a server-side `answers` list, matched by `question_id`.
+
+#### Authentication
+Requires `Authorization: Bearer <jwt>` (same scheme as `/ask`). `user_id` comes from the verified token and scopes retrieval to that user's own content only — never accepted from the request body.
+**Pipeline:** topic → embedding search (Pinecone) → full text resolve (MongoDB) → LLM generates structured questions per `quiz_type` → split into a public `questions` list (no answers) and a server-side `answers` list, matched by `question_id`.
+
+---
+
+### `GET /health`
+
+**Response `200`:**
+```json
+{"status": "ok"}
+```
+
+---
+
+### `POST /generate-quiz`
+
+#### Request body
+
+| Field | Type | Required | Default | Notes |
+|-------|------|----------|---------|--------|
+| `topic` | string | yes | — | Non-empty |
+| `question_count` | integer | no | `5` | Clamped **1–20** |
+| `quiz_type` | string | yes | — | One of: `mcq`, `true_false`, `fill_blank`, `short_answer` |
+
+#### Response `200`
+
+```json
+{
+  "success": true,
+  "message": "Generated 3 questions.",
+  "questions": [
+    {
+      "question_id": "74724f0b-4d3c-4d7c-8752-e1ec089c262a",
+      "question": "Where does photosynthesis primarily occur in plant cells?",
+      "question_type": "mcq",
+      "options": ["Roots", "Stems", "Leaves", "Flowers"],
+      "difficulty": "medium",
+      "topic": "photosynthesis"
+    }
+  ],
+  "answers": [
+    {
+      "question_id": "74724f0b-4d3c-4d7c-8752-e1ec089c262a",
+      "answer": "Leaves",
+      "explanation": null
+    }
+  ]
+}
+```
+
+**Note:** `questions` (shown to the user before submission) never includes the correct answer. Answers are returned in a separate list, matched by `question_id`, so the frontend can grade after submission without exposing answers upfront. `options` is `null` for `fill_blank` and `short_answer` types, and `["True", "False"]` for `true_false`.
+
+#### Errors
+
+| Status | When |
+|--------|------|
+| `400` | Invalid `quiz_type`, or no relevant content found for `topic` (returned as `success: false` in body) |
+| `502` | Upstream generation error (e.g. LLM returned malformed data) |
+
+
+## Knowledge Graph (Team Lambda)
+
+**Service root:** `ai-ml/knowledge_graph/`
+
+**Default local base URL:** `http://127.0.0.1:8005`
+## Roadmap Generation (Team Lambda)
+
+**Service root:** `ai-ml/roadmap_generator/`
+
+**Default local base URL:** `http://127.0.0.1:8004` *(pending final port confirmation)*
+
+**Run:**
+
+```bash
+cd ai-ml
+uvicorn knowledge_graph.app.api.graph_routes:app --reload --port 8005
+```
+
+Interactive docs: [http://127.0.0.1:8005/docs](http://127.0.0.1:8005/docs)
+
+**Pipeline:** groups a user's embedded chunks by document → averages each document's vectors → compares every pair (cosine similarity) → creates an edge above threshold → labels it via shared-keyword extraction, with a `relationship_type` field reserved for future LLM-based semantic classification (currently defaults to `"related_to"` for all edges pending that work).
+
+#### Authentication
+
+Requires header: `Authorization: Bearer <jwt>`, same scheme as Quiz Generation and Chatbot — verified against `JWT_SECRET_KEY` (HS256), identity read from the token's `sub` claim.
+uvicorn roadmap_generator.app.main:app --reload --port 8004
+```
+
+Interactive docs: [http://127.0.0.1:8004/docs](http://127.0.0.1:8004/docs)
+
+**Auth:** Requires `Authorization: Bearer <jwt>` on every endpoint (same scheme as Quiz Generation and Weak Topic Detection — HS256, `JWT_SECRET_KEY`, identity from the token's `sub` claim).
+
+---
+
+### `GET /health`
+
+**Response `200`:**
+```json
+{"status": "ok"}
+```
+
+---
+
+### `GET /graph`
+
+Returns the authenticated user's current knowledge graph — all embedded documents as nodes, all above-threshold relationships as edges. Does not rebuild the graph; call `/graph/rebuild` first if new content has been added since the last build.
+
+#### Response `200`
+
+```json
+{
+  "nodes": [
+    {"id": "6561c06b-...", "title": "decision_trees", "node_type": "document"},
+    {"id": "82c4705e-...", "title": "machine_learning_intro", "node_type": "document"}
+  ],
+  "edges": [
+    {
+      "user_id": "test_user",
+      "source_id": "6561c06b-...",
+      "target_id": "82c4705e-...",
+      "node_type": "document",
+      "similarity": 0.6528,
+      "source_title": "decision_trees",
+      "target_title": "machine_learning_intro",
+      "label": "shared terms: algorithms, learning, machine",
+      "relationship_type": "related_to"
+    }
+  ]
+}
+```
+
+| Field | Type | Notes |
+|-------|------|--------|
+| `nodes[].id` | string | Document ID |
+| `nodes[].title` | string | Document title |
+| `nodes[].node_type` | string | Currently always `"document"` |
+| `edges[].node_type` | string | `"document"` or `"topic"` — which graph layer this edge belongs to |
+| `edges[].similarity` | float | Cosine similarity score, 0–1 |
+| `edges[].label` | string | Shared-keyword explanation of the connection |
+| `edges[].relationship_type` | string | Currently always `"related_to"` — reserved for future LLM-based classification (e.g. `"prerequisite_of"`, `"example_of"`) |
+
+---
+
+### `POST /graph/rebuild`
+
+Rebuilds the authenticated user's graph from their current embedded content — deletes existing edges and recreates them fresh.
+
+#### Response `200`
+
+```json
+{
+  "user_id": "test_user",
+  "document_edges_created": 1,
+  "topic_edges_created": 1
+}
+```
+
+---
+
+### `DELETE /graph`
+
+Deletes all graph edges for the authenticated user.
+
+#### Response `200`
+
+```json
+{"user_id": "test_user", "deleted": true}
+```
+
+---
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `403` | Missing `Authorization` header |
+| `401` | Token present but invalid/expired |
+| `500` | Server missing `JWT_SECRET_KEY` |
+### `POST /generate-roadmap`
+
+Supports three generation modes via the `mode` field. Exactly one mode's required field(s) must be supplied.
+
+#### Request body — common fields
+
+| Field | Type | Required | Default | Notes |
+|-------|------|----------|---------|-------|
+| `mode` | string | yes | — | One of: `topic`, `document`, `quiz_performance` |
+| `subject` | string | no | `""` | Optional overall title for the roadmap |
+| `step_count` | integer | no | `6` | Clamped **3–15** |
+
+#### Mode: `topic`
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `topic_names` | array[string] | **yes** (for this mode) | List of topic/subject names |
+| `priorities` | object | no | `{topic_name: "high"\|"normal"\|"low"}` |
+
+**Example request:**
+```json
+{
+  "mode": "topic",
+  "topic_names": ["Recursion", "Dynamic programming"],
+  "subject": "Algorithms",
+  "step_count": 4,
+  "priorities": {"Recursion": "high"}
+}
+```
+
+#### Mode: `document`
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `document_id` | string | **yes** (for this mode) | Must belong to the authenticated user |
+
+Topics are extracted automatically from the document's ingested content (YAKE keyword extraction). Returns **400** if the document has no content, doesn't exist, or belongs to a different user (these cases are indistinguishable in the response, by design).
+
+**Example request:**
+```json
+{
+  "mode": "document",
+  "document_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "step_count": 6
+}
+```
+
+#### Mode: `quiz_performance`
+
+No mode-specific fields — uses the authenticated user's Weak Topic Detection results. Weak topics are prioritized ("high") in the generated sequence. Returns **400** if no weak topics are found (e.g. user hasn't taken a quiz yet).
+
+**Example request:**
+```json
+{
+  "mode": "quiz_performance",
+  "step_count": 5
+}
+```
+
+**Known limitation:** Weak Topic Detection currently reads from a static demo dataset, not live per-user quiz history — `quiz_performance` mode inherits this limitation until per-user quiz ingestion is wired in.
+
+#### Response `200` (all modes — same shape)
+
+```json
+{
+  "success": true,
+  "message": "Generated 4 steps.",
+  "mode": "topic",
+  "subject": "Algorithms",
+  "steps": [
+    {
+      "step_number": 1,
+      "topic": "Recursion Fundamentals",
+      "description": "Learn base cases, call stack mechanics...",
+      "estimated_duration": "2-3 days"
+    }
+  ],
+  "total_steps": 4
+}
+```
+
+#### Errors
+
+
+| Status | When |
+|--------|------|
+| `400` | Missing mode-specific required field; invalid `mode`; no content/topics found for the given input |
+| `401` | Token present but invalid/expired |
+| `403` | Missing `Authorization` header |
+| `422` | Request body fails schema validation |
+| `502` | Upstream generation error (e.g. LLM returned malformed data) |
